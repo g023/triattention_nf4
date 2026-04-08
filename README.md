@@ -12,7 +12,7 @@ A full implementation of the [TriAttention](https://arxiv.org/abs/2604.04921) KV
 
 **NOTE:** Example usage references a `Qwen3-1.77B NF4` model located in a `./Qwen3-NF4` folder in the same folder as the script 'triattention_nf4.py'. 
 
-(https://huggingface.co/g023/Qwen3-1.77B-g023-NF4) > throw in a folder called './Qwen3-NF4' with the model files. 
+(https://huggingface.co/g023/Qwen3-1.77B-g023-NF4) > throw model files in a folder called './Qwen3-NF4', in same folder as 'triattention_nf4.py'.
 
 ---
 
