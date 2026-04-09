@@ -14,9 +14,10 @@ A full implementation of the [TriAttention](https://arxiv.org/abs/2604.04921) KV
 
 (https://huggingface.co/g023/Qwen3-1.77B-g023-NF4) > throw model files in a folder called './Qwen3-NF4', in same folder as 'triattention_nf4.py'.
 
-**NOTE:** Currently working on (almost finished) compatibility with Qwen3.5 more specifically this model: (https://huggingface.co/g023/Qwopus3.5-9B-v3-NF4)
-Current output for qwen3.5 work (will upload and remove this comment when done):
+**NOTE:** Compatible now ALSO with: (https://huggingface.co/g023/Qwopus3.5-9B-v3-NF4)
+Current output for qwen3.5 work:
 ```
+# heavy compress run
 triattention_nf4.py --model ./qwop-v3-9b-nf4 --prompt "Write a story" --budget 64 --recent-tokens 32 --benchmark --benchmark-tokens 512
 
 ----------------------------------------------------------------------
