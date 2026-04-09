@@ -15,6 +15,10 @@ Key features:
   - Attention sink protection + recent window protection
   - Custom generation loop with explicit position tracking
 
+  - tested with the models: 
+  -- https://huggingface.co/g023/Qwopus3.5-9B-v3-NF4
+  -- https://huggingface.co/g023/Qwen3-1.77B-g023-NF4
+
 Based on: "TriAttention: Efficient Long Reasoning with Trigonometric KV
 Compression" (Mao et al., 2026, arxiv:2604.04921)
 
@@ -68,22 +72,93 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
+# ARCHITECTURE DETECTION
+# =============================================================================
+
+def get_model_arch_info(model):
+    """
+    Detect model architecture specifics for TriAttention.
+
+    Returns dict with:
+      - full_attn_layer_indices: list of int (layers with KV cache)
+      - partial_rotary_factor: float (1.0 for full RoPE)
+      - rotary_dim: int (number of dims that get RoPE)
+      - half_dim: int (rotary_dim // 2, for complex representation)
+      - has_gated_q: bool (Qwen3.5 gates Q output)
+      - is_hybrid: bool (True if model mixes linear + full attention)
+    """
+    config = model.config
+    head_dim = getattr(config, "head_dim", None) or \
+        config.hidden_size // config.num_attention_heads
+    num_layers = config.num_hidden_layers
+
+    # Detect full_attention layer indices
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types:
+        full_attn_indices = [i for i, t in enumerate(layer_types) if t == "full_attention"]
+        is_hybrid = any(t != "full_attention" for t in layer_types)
+    else:
+        full_attn_indices = list(range(num_layers))
+        is_hybrid = False
+
+    # Partial rotary factor
+    prf = getattr(config, "partial_rotary_factor", None)
+    if prf is None and hasattr(config, "rope_parameters"):
+        prf = config.rope_parameters.get("partial_rotary_factor", None)
+    if prf is None:
+        prf = 1.0
+
+    rotary_dim = int(head_dim * prf)
+    half_dim = rotary_dim // 2
+
+    # Gated Q detection
+    has_gated_q = getattr(config, "attn_output_gate", False)
+
+    info = {
+        "full_attn_layer_indices": full_attn_indices,
+        "partial_rotary_factor": prf,
+        "rotary_dim": rotary_dim,
+        "half_dim": half_dim,
+        "has_gated_q": has_gated_q,
+        "is_hybrid": is_hybrid,
+        "head_dim": head_dim,
+    }
+    logger.info(f"Architecture: {config.architectures[0] if hasattr(config, 'architectures') else 'unknown'}, "
+                f"full_attn_layers={len(full_attn_indices)}/{num_layers}, "
+                f"rotary_dim={rotary_dim}/{head_dim}, gated_q={has_gated_q}")
+    return info
+
+
+# =============================================================================
 # ROPE FREQUENCY UTILITIES
 # =============================================================================
 
-def get_rope_frequencies(model):
+def get_rope_frequencies(model, arch_info=None):
     """
     Extract RoPE inverse frequencies from the model's rotary embedding.
 
-    Returns tensor of shape [head_dim/2] with ω_f = θ^(-2f/d).
+    For models with partial_rotary_factor < 1.0 (e.g. Qwen3.5), only
+    computes frequencies for the rotary portion of head_dim.
+
+    Returns tensor of shape [rotary_dim/2] with ω_f = θ^(-2f/d).
     """
     config = model.config
     rope_theta = config.rope_parameters.get("rope_theta", 10000.0)
     head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
 
+    # Determine rotary dimension
+    if arch_info:
+        rotary_dim = arch_info["rotary_dim"]
+    else:
+        prf = getattr(config, "partial_rotary_factor", None)
+        if prf is None and hasattr(config, "rope_parameters"):
+            prf = config.rope_parameters.get("partial_rotary_factor", None)
+        rotary_dim = int(head_dim * (prf or 1.0))
+
     # ω_f = θ^(-2f/d) = 1 / θ^(2f/d)
-    inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
-    return inv_freq  # shape: [head_dim/2]
+    # Note: freq base uses rotary_dim (not full head_dim)
+    inv_freq = 1.0 / (rope_theta ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim))
+    return inv_freq  # shape: [rotary_dim/2]
 
 
 # =============================================================================
@@ -104,7 +179,7 @@ class TriAttentionCalibrator:
       - mrl[layer][head]: Mean Resultant Length R_f tensor [d/2]
     """
 
-    def __init__(self, model):
+    def __init__(self, model, arch_info=None):
         self.model = model
         self.config = model.config
         self.num_layers = self.config.num_hidden_layers
@@ -112,7 +187,18 @@ class TriAttentionCalibrator:
         self.num_kv_heads = self.config.num_key_value_heads
         self.head_dim = getattr(self.config, "head_dim", None) or \
             self.config.hidden_size // self.config.num_attention_heads
-        self.half_dim = self.head_dim // 2
+
+        # Architecture-specific settings
+        if arch_info:
+            self.full_attn_indices = arch_info["full_attn_layer_indices"]
+            self.half_dim = arch_info["half_dim"]
+            self.rotary_dim = arch_info["rotary_dim"]
+            self.has_gated_q = arch_info["has_gated_q"]
+        else:
+            self.full_attn_indices = list(range(self.num_layers))
+            self.half_dim = self.head_dim // 2
+            self.rotary_dim = self.head_dim
+            self.has_gated_q = False
 
         # Running statistics accumulators
         # Per layer, per head: complex sum and norm sum
@@ -133,14 +219,18 @@ class TriAttentionCalibrator:
         else:
             layers = self.model.layers
 
-        for layer_idx, layer in enumerate(layers):
+        has_gated_q = self.has_gated_q
+        rotary_dim = self.rotary_dim
+
+        for layer_idx in self.full_attn_indices:
+            layer = layers[layer_idx]
             attn = layer.self_attn
 
             # We monkey-patch the forward to capture pre-RoPE Q
             # This is the cleanest way to get Q after q_norm but before RoPE
             original_forward = attn.forward.__func__ if hasattr(attn.forward, '__func__') else attn.forward
 
-            def make_hook(l_idx, orig_fwd, attn_module):
+            def make_hook(l_idx, orig_fwd, attn_module, gated_q, rot_dim):
                 def hooked_forward(self_attn, hidden_states, position_embeddings,
                                    attention_mask=None, past_key_values=None,
                                    cache_position=None, **kwargs):
@@ -148,9 +238,23 @@ class TriAttentionCalibrator:
                     input_shape = hidden_states.shape[:-1]
                     hidden_shape = (*input_shape, -1, self_attn.head_dim)
 
-                    pre_rope_q = self_attn.q_norm(
-                        self_attn.q_proj(hidden_states).view(hidden_shape)
-                    ).transpose(1, 2)  # [batch, num_q_heads, seq, head_dim]
+                    if gated_q:
+                        # Qwen3.5: q_proj outputs 2x width, split into query + gate
+                        q_proj_out = self_attn.q_proj(hidden_states)
+                        q_proj_view = q_proj_out.view(*input_shape, -1, self_attn.head_dim * 2)
+                        query_states, _gate = torch.chunk(q_proj_view, 2, dim=-1)
+                        pre_rope_q = self_attn.q_norm(
+                            query_states.view(hidden_shape)
+                        ).transpose(1, 2)
+                    else:
+                        # Qwen3: standard q_proj
+                        pre_rope_q = self_attn.q_norm(
+                            self_attn.q_proj(hidden_states).view(hidden_shape)
+                        ).transpose(1, 2)  # [batch, num_q_heads, seq, head_dim]
+
+                    # Only use rotary portion for calibration stats
+                    if rot_dim < self_attn.head_dim:
+                        pre_rope_q = pre_rope_q[..., :rot_dim]
 
                     # Store for calibration
                     calibrator_ref = self_attn._calibrator_ref
@@ -171,7 +275,7 @@ class TriAttentionCalibrator:
             # Bind the hooked forward
             import types
             attn.forward = types.MethodType(
-                make_hook(layer_idx, original_forward, attn), attn
+                make_hook(layer_idx, original_forward, attn, has_gated_q, rotary_dim), attn
             )
             self.hooks.append((attn, original_forward))
 
@@ -241,7 +345,7 @@ class TriAttentionCalibrator:
 
         # Compute final statistics
         calibration_data = {}
-        for layer_idx in range(self.num_layers):
+        for layer_idx in self.full_attn_indices:
             if layer_idx not in self.q_complex_sum:
                 logger.warning(f"No calibration data for layer {layer_idx}")
                 continue
@@ -291,12 +395,13 @@ class TriAttentionScorer:
     """
 
     def __init__(self, calibration_data, rope_inv_freq, num_q_heads, num_kv_heads,
-                 future_offsets=None):
+                 future_offsets=None, rotary_dim=None):
         self.calibration_data = calibration_data
         self.rope_inv_freq = rope_inv_freq  # [D/2]
         self.num_q_heads = num_q_heads
         self.num_kv_heads = num_kv_heads
         self.gqa_ratio = num_q_heads // num_kv_heads  # G
+        self.rotary_dim = rotary_dim  # If set, only use first rotary_dim of key for scoring
 
         if future_offsets is None:
             future_offsets = FUTURE_OFFSETS
@@ -318,13 +423,20 @@ class TriAttentionScorer:
         device = cached_keys.device
 
         seq_len = cached_keys.shape[2]
-        half_dim = cached_keys.shape[3] // 2
         G = self.gqa_ratio
         KV = self.num_kv_heads
 
+        # For partial rotary models, only use the rotary portion of keys
+        if self.rotary_dim is not None and self.rotary_dim < cached_keys.shape[3]:
+            keys_for_scoring = cached_keys[0, :, :, :self.rotary_dim]  # [KV, S, rotary_dim]
+        else:
+            keys_for_scoring = cached_keys[0]  # [KV, S, head_dim]
+
+        half_dim = keys_for_scoring.shape[2] // 2
+
         # Convert cached keys to complex: k̃_f = k[f] + i·k[f+d/2]
-        k_real = cached_keys[0, :, :, :half_dim].float()  # [KV, S, D/2]
-        k_imag = cached_keys[0, :, :, half_dim:].float()
+        k_real = keys_for_scoring[:, :, :half_dim].float()  # [KV, S, D/2]
+        k_imag = keys_for_scoring[:, :, half_dim:].float()
         k_complex = torch.complex(k_real, k_imag)
         k_norms = k_complex.abs()    # [KV, S, D/2]
         k_phases = k_complex.angle()  # [KV, S, D/2]
@@ -396,17 +508,28 @@ class TriAttentionPruner:
     """
 
     def __init__(self, scorer, budget=KV_BUDGET, window_size=WINDOW_SIZE,
-                 recent_tokens=RECENT_TOKENS, sink_tokens=SINK_TOKENS):
+                 recent_tokens=RECENT_TOKENS, sink_tokens=SINK_TOKENS,
+                 full_attn_layer_indices=None):
         self.scorer = scorer
         self.budget = budget
         self.window_size = window_size
         self.recent_tokens = recent_tokens
         self.sink_tokens = sink_tokens
+        self.full_attn_layer_indices = full_attn_layer_indices  # If None, all layers
 
         # State
         self.gen_step = 0
         self.total_pruned = 0
         self.prune_count = 0
+
+    def _get_cache_size(self, past_key_values):
+        """Get KV cache size from a full_attention layer."""
+        if self.full_attn_layer_indices:
+            # Use first full_attention layer for seq_length
+            idx = self.full_attn_layer_indices[0]
+            if idx < len(past_key_values.layers):
+                return past_key_values.get_seq_length(idx)
+        return past_key_values.get_seq_length()
 
     def should_prune(self, cache_size):
         """Check if pruning should trigger."""
@@ -425,26 +548,34 @@ class TriAttentionPruner:
         Returns:
             Modified past_key_values with evicted entries removed
         """
-        # Get cache size from first layer
-        cache_size = past_key_values.get_seq_length()
+        # Get cache size from a full_attention layer
+        cache_size = self._get_cache_size(past_key_values)
         if cache_size <= self.budget:
             return past_key_values
+
+        # Determine which layer indices to score/prune
+        if self.full_attn_layer_indices:
+            scoreable_layers = [i for i in self.full_attn_layer_indices
+                                if i in self.scorer.calibration_data]
+        else:
+            scoreable_layers = list(range(len(past_key_values.layers)))
 
         # Determine protected indices
         n_sink = min(self.sink_tokens, cache_size)
         n_recent = min(self.recent_tokens, cache_size)
 
-        # Score keys across sampled layers (every 4th layer for efficiency,
-        # covers early/mid/late representations)
-        device = past_key_values.layers[0].keys.device
+        # Score keys across sampled full_attention layers
+        first_full_attn = scoreable_layers[0] if scoreable_layers else 0
+        device = past_key_values.layers[first_full_attn].keys.device
         all_scores = torch.zeros(cache_size, device=device, dtype=torch.float32)
-        n_layers = len(past_key_values.layers)
-        sample_stride = max(1, n_layers // 8)  # ~8 layers sampled
+
+        # Sample ~8 layers from the full_attention layers
+        n_scoreable = len(scoreable_layers)
+        sample_stride = max(1, n_scoreable // 8)
 
         scored_layers = 0
-        for layer_idx in range(0, n_layers, sample_stride):
-            if layer_idx not in self.scorer.calibration_data:
-                continue
+        for i in range(0, n_scoreable, sample_stride):
+            layer_idx = scoreable_layers[i]
             cached_keys = past_key_values.layers[layer_idx].keys
             layer_scores = self.scorer.score_keys(layer_idx, cached_keys, current_pos)
             all_scores += layer_scores
@@ -474,7 +605,7 @@ class TriAttentionPruner:
             )
             keep_mask[top_indices] = True
 
-        # Apply pruning across all layers
+        # Apply pruning only to layers that have KV caches
         keep_indices = keep_mask.nonzero(as_tuple=True)[0]
         n_evicted = cache_size - keep_indices.shape[0]
 
@@ -483,6 +614,9 @@ class TriAttentionPruner:
 
         for layer_idx in range(len(past_key_values.layers)):
             layer = past_key_values.layers[layer_idx]
+            # Only prune layers that have KV caches (full_attention layers)
+            if not hasattr(layer, 'keys') or layer.keys is None or layer.keys.numel() == 0:
+                continue
             # layer.keys: [batch, heads, seq, head_dim]
             layer.keys = layer.keys[:, :, keep_indices, :].contiguous()
             layer.values = layer.values[:, :, keep_indices, :].contiguous()
@@ -490,7 +624,7 @@ class TriAttentionPruner:
         self.total_pruned += n_evicted
         self.prune_count += 1
 
-        new_size = past_key_values.get_seq_length()
+        new_size = self._get_cache_size(past_key_values)
         logger.debug(f"Pruned {n_evicted} tokens: {cache_size} → {new_size} "
                      f"(budget={self.budget})")
 
@@ -523,8 +657,8 @@ def generate_with_triattention(model, tokenizer, input_ids, pruner,
     device = input_ids.device
     n_prompt = input_ids.shape[1]
 
-    # Initialize KV cache
-    past_key_values = DynamicCache()
+    # Initialize KV cache — let model create its own (hybrid-compatible)
+    past_key_values = None
 
     # Process prompt
     with torch.no_grad():
@@ -584,7 +718,7 @@ def generate_with_triattention(model, tokenizer, input_ids, pruner,
             current_pos += 1
             pruner.gen_step += 1
 
-            cache_size = past_key_values.get_seq_length()
+            cache_size = pruner._get_cache_size(past_key_values)
             if pruner.should_prune(cache_size):
                 past_key_values = pruner.prune(past_key_values, current_pos)
 
@@ -646,7 +780,7 @@ def generate_with_triattention(model, tokenizer, input_ids, pruner,
         pruner.gen_step += 1
 
         # Check for pruning
-        cache_size = past_key_values.get_seq_length()
+        cache_size = pruner._get_cache_size(past_key_values)
         if pruner.should_prune(cache_size):
             past_key_values = pruner.prune(past_key_values, current_pos)
 
@@ -665,7 +799,7 @@ def generate_with_triattention(model, tokenizer, input_ids, pruner,
         'tokens_per_sec': n_gen / elapsed if elapsed > 0 else 0,
         'prune_events': pruner.prune_count,
         'total_pruned': pruner.total_pruned,
-        'final_cache_size': past_key_values.get_seq_length(),
+        'final_cache_size': pruner._get_cache_size(past_key_values),
         'peak_vram_mb': peak_mem_mb,
     }
 
@@ -682,8 +816,8 @@ def load_model(model_path, device_map=DEVICE_MAP):
     logger.info(f"Loading model: {model_path}")
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        device_map=device_map,
-        dtype=torch.bfloat16,
+        # device_map=device_map,
+        # dtype=torch.bfloat16,
     )
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     logger.info("Model loaded.")
@@ -697,10 +831,19 @@ def prepare_prompt(tokenizer, prompt, system_prompt=None):
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": prompt})
 
-    text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True,
-        enable_thinking=True
-    )
+    try:
+        text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+            enable_thinking=True
+        )
+    except (TypeError, Exception) as e:
+        if 'enable_thinking' in str(e) or 'UndefinedError' in type(e).__name__ or isinstance(e, TypeError):
+            # Qwen3.5 and some models don't support enable_thinking
+            text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            )
+        else:
+            raise
     input_ids = tokenizer(text, return_tensors="pt").input_ids
     return input_ids
 
@@ -780,15 +923,18 @@ Examples:
     model, tokenizer = load_model(args.model)
     device = next(model.parameters()).device
 
+    # Detect architecture
+    arch_info = get_model_arch_info(model)
+
     # Prepare prompt
     input_ids = prepare_prompt(tokenizer, args.prompt, args.system_prompt).to(device)
     logger.info(f"Prompt: {input_ids.shape[1]} tokens")
 
     # Extract RoPE frequencies
-    rope_inv_freq = get_rope_frequencies(model)
+    rope_inv_freq = get_rope_frequencies(model, arch_info)
 
     # Calibrate
-    calibrator = TriAttentionCalibrator(model)
+    calibrator = TriAttentionCalibrator(model, arch_info)
     calibration_data = calibrator.calibrate(input_ids)
 
     # Create scorer
@@ -798,6 +944,7 @@ Examples:
         rope_inv_freq=rope_inv_freq,
         num_q_heads=config.num_attention_heads,
         num_kv_heads=config.num_key_value_heads,
+        rotary_dim=arch_info["rotary_dim"],
     )
 
     if args.benchmark:
@@ -816,6 +963,7 @@ Examples:
             window_size=args.window_size,
             recent_tokens=args.recent_tokens,
             sink_tokens=args.sink_tokens,
+            full_attn_layer_indices=arch_info["full_attn_layer_indices"],
         )
         pruned_text, pruned_stats = generate_with_triattention(
             model, tokenizer, input_ids, pruner,
@@ -839,6 +987,7 @@ Examples:
             window_size=args.window_size,
             recent_tokens=args.recent_tokens,
             sink_tokens=args.sink_tokens,
+            full_attn_layer_indices=arch_info["full_attn_layer_indices"],
         )
         baseline_text, baseline_stats = generate_with_triattention(
             model, tokenizer, input_ids, baseline_pruner,
@@ -920,6 +1069,7 @@ Examples:
             window_size=args.window_size,
             recent_tokens=args.recent_tokens,
             sink_tokens=args.sink_tokens,
+            full_attn_layer_indices=arch_info["full_attn_layer_indices"],
         )
 
         try:
