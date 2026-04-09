@@ -14,6 +14,8 @@ A full implementation of the [TriAttention](https://arxiv.org/abs/2604.04921) KV
 
 (https://huggingface.co/g023/Qwen3-1.77B-g023-NF4) > throw model files in a folder called './Qwen3-NF4', in same folder as 'triattention_nf4.py'.
 
+**NOTE:** Currently working on (almost finished) compatibility with Qwen3.5 more specifically this model: (https://huggingface.co/g023/Qwopus3.5-9B-v3-NF4)
+
 ---
 
 ## What is TriAttention?
