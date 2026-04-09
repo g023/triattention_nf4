@@ -369,11 +369,11 @@ for step in range(max_tokens):
 ```
 triattention_nf4/
 ├── triattention_nf4.py       # Main implementation
-├── Qwen3-NF4/                # Test model (NF4 quantized)
-│   ├── config.json
-│   ├── model.safetensors
-│   ├── tokenizer.json
-│   └── ...
+└── Qwen3-NF4/                # Test model (NF4 quantized)
+    ├── config.json
+    ├── model.safetensors
+    ├── tokenizer.json
+    └── ...
 ```
 
 ## Code Architecture
